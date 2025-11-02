@@ -75,17 +75,17 @@ if is_veomni_patch_available():
     )
 else:
 
-    def load_step2token(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+    # def load_step2token(*args, **kwargs):
+    #     raise ImportError("veomni_patch is not available, please install it first")
 
-    def save_step2token(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+    # def save_step2token(*args, **kwargs):
+    #     raise ImportError("veomni_patch is not available, please install it first")
 
-    def is_remote_path(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+    # def is_remote_path(*args, **kwargs):
+    #     raise ImportError("veomni_patch is not available, please install it first")
 
-    def convert_hdfs_fuse_path(*args, **kwargs):
-        raise ImportError("veomni_patch is not available, please install it first")
+    # def convert_hdfs_fuse_path(*args, **kwargs):
+    #     raise ImportError("veomni_patch is not available, please install it first")
 
     VALID_CONFIG_TYPE = None
     VEOMNI_UPLOAD_CMD = None

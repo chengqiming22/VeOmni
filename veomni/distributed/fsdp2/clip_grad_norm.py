@@ -201,5 +201,5 @@ def _fsdp2_reduce_and_clip(
         total_p = _fsdp2_reduce_group(params, norm_type, reduce_groups)
         total_norm = total_p ** (1.0 / float(norm_type))
 
-    torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach=foreach)
+    torch.nn.utils.clip_grad_norm_(params, max_norm, total_norm, foreach=foreach)
     return total_norm

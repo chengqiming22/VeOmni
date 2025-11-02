@@ -36,6 +36,26 @@ def split_into_chunks(sequence: Sequence[int], chunk_size: int) -> List[List[int
     return chunks
 
 
+def process_prepared_example(
+    example: Dict[str, Any],
+    max_seq_len: int,
+    source_name: Optional[str] = None,
+) -> List[Dict[str, "torch.Tensor"]]:
+    input_ids = example["input_ids"]
+    labels = example.get("labels")
+
+    input_ids = torch.tensor(input_ids)
+    attention_mask = torch.tensor([1] * len(input_ids))
+    labels = torch.tensor(labels) if labels else input_ids
+    return [
+        {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+    ]
+
+
 def process_pretrain_example(
     example: Dict[str, Any],
     tokenizer: "PreTrainedTokenizer",

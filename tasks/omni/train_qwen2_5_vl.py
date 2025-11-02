@@ -4,13 +4,14 @@ import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Callable, Dict, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 import wandb
 from PIL import Image
 from tqdm import trange
+from qwen_vl_utils import process_vision_info
 
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
@@ -55,6 +56,33 @@ ROLE_MAPPING = {
     "human": "user",
     "gpt": "assistant",
 }
+
+
+def process_prepared_example(
+    example: Dict[str, Any],
+    processor: "ProcessorMixin",
+    max_seq_len: int,
+    source_name: Optional[str] = None,
+) -> List[Dict[str, "torch.Tensor"]]:
+    messages = example["messages"]
+    if isinstance(messages, str):
+        messages = json.loads(messages)
+
+    text = processor.apply_chat_template(messages, tokenize=False)
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=text,
+        # images=image_inputs,
+        # videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs["input_ids"] = inputs["input_ids"].squeeze()
+    # inputs["image_mask"] = inputs["input_ids"] == processor.image_token_id
+    # inputs["input_ids"][inputs["image_mask"]] = 0
+    inputs["labels"] = inputs["input_ids"].clone()
+    inputs["attention_mask"] = inputs["attention_mask"].squeeze()
+    return [inputs]
 
 
 def process_sample(
@@ -138,7 +166,8 @@ def main():
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    dist.init_process_group(backend=get_nccl_backend())
+    if not dist.is_initialized():
+        dist.init_process_group(backend=get_nccl_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
@@ -173,15 +202,22 @@ def main():
 
     logger.info_rank0("Prepare data")
     processor = build_processor(args.model.tokenizer_path)
-    processor.image_processor.max_pixels = MAX_PIXELS
-    position_id_func = model.get_position_id_func()
-    chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
-    transform = partial(
-        process_sample,
-        processor=processor,
-        chat_template=chat_template,
-        position_id_func=position_id_func,
-    )
+    if args.data.data_type == "prepared":
+        transform = partial(
+            process_prepared_example,
+            processor=processor,
+            max_seq_len=args.data.max_seq_len,
+        )
+    elif args.data.data_type == "conversation":
+        processor.image_processor.max_pixels = MAX_PIXELS
+        position_id_func = model.get_position_id_func()
+        chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
+        transform = partial(
+            process_sample,
+            processor=processor,
+            chat_template=chat_template,
+            position_id_func=position_id_func,
+        )
 
     if args.train.rmpad:
         raise ValueError("Qwen2-VL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
@@ -345,13 +381,13 @@ def main():
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
 
-        data_loader_tqdm = trange(
-            args.train.train_steps,
-            desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
-            total=args.train.train_steps,
-            initial=start_step,
-            disable=args.train.local_rank != 0,
-        )
+        # data_loader_tqdm = trange(
+        #     args.train.train_steps,
+        #     desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
+        #     total=args.train.train_steps,
+        #     initial=start_step,
+        #     disable=args.train.local_rank != 0,
+        # )
         data_iterator = iter(train_dataloader)
         for _ in range(start_step, args.train.train_steps):
             global_step += 1
@@ -404,8 +440,9 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
-            data_loader_tqdm.update()
+            # data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            # data_loader_tqdm.update()
+            logger.info_rank0(f"{global_step} / {args.train.train_steps}, loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, elapsed time: {delta_time:.2f}s")
 
             if args.train.global_rank == 0:
                 if args.train.use_wandb:
@@ -443,7 +480,7 @@ def main():
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
-        data_loader_tqdm.close()
+        # data_loader_tqdm.close()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
@@ -460,13 +497,13 @@ def main():
                 },
             }
             Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-            if args.train.global_rank == 0:
-                helper.save_step2token(
-                    args.train.step2token_path,
-                    consumed_tokens=train_metrics["consume_tokens(B)"],
-                    global_step=global_step,
-                    save_checkpoint_path=save_checkpoint_path,
-                )
+            # if args.train.global_rank == 0:
+            #     helper.save_step2token(
+            #         args.train.step2token_path,
+            #         consumed_tokens=train_metrics["consume_tokens(B)"],
+            #         global_step=global_step,
+            #         save_checkpoint_path=save_checkpoint_path,
+            #     )
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
