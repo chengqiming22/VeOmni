@@ -91,7 +91,7 @@ class MyDataArguments(DataArguments):
 @dataclass
 class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
-    data: "DataArguments" = field(default_factory=DataArguments)
+    data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
 
 
@@ -100,7 +100,8 @@ def main():
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    dist.init_process_group(backend=get_nccl_backend())
+    if not dist.is_initialized():
+        dist.init_process_group(backend=get_nccl_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()

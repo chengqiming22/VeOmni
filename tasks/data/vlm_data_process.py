@@ -10,6 +10,7 @@ Functions:
     process_sample_qwen3_vl: Process samples for Qwen3-VL models
 """
 
+import json
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict
 
@@ -90,11 +91,13 @@ def process_sample_qwen2_5_vl(
         kwargs["source_name"] if "source_name" in kwargs else sample["source"]
     )  # source_name if use multisource_dataset
     conversations = sample["conversations"] if "conversations" in sample else sample["text"]  # text-only data
-    conversations = conv_preprocess(source, conversations, **kwargs)
+    # conversations = conv_preprocess(source, conversations, **kwargs)
+    if isinstance(conversations, str):
+        conversations = json.loads(conversations)
 
     token_num_inputs, image_inputs, video_inputs = {}, {}, {}
     image_grid_thw, video_grid_thw = None, None
-    if "images" in sample:
+    if sample.get("images") is not None:
         images = fetch_images(sample["images"], **kwargs)
         image_inputs = processor.image_processor(images=images, return_tensors="pt")
         image_grid_thw = image_inputs["image_grid_thw"]
