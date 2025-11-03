@@ -19,7 +19,7 @@ from veomni.data import (
     build_iterative_dataset,
     build_mapping_dataset,
 )
-from veomni.data.data_transform import process_pretrain_example, process_sft_example
+from veomni.data.data_transform import process_pretrain_example, process_sft_example, process_prepared_example
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -47,7 +47,10 @@ class Arguments:
 
 
 def main():
-    dist.init_process_group(backend=get_nccl_backend())
+    if not dist.is_initialized():
+        dist.init_process_group(backend=get_nccl_backend())
+    else:
+        dist.barrier()
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
@@ -75,7 +78,12 @@ def main():
 
     logger.info_rank0("Prepare data")
     tokenizer = build_tokenizer(args.model.tokenizer_path)
-    if args.data.data_type == "plaintext":
+    if args.data.data_type == "prepared":
+        transform = partial(
+            process_prepared_example,
+            max_seq_len=args.data.max_seq_len,
+        )
+    elif args.data.data_type == "plaintext":
         transform = partial(
             process_pretrain_example,
             tokenizer=tokenizer,
@@ -206,7 +214,7 @@ def main():
             )
 
         # save model_assets before training
-        model_assets = [model_config, tokenizer if args.data.data_type == "plaintext" else chat_template]
+        model_assets = [model_config, tokenizer if args.data.data_type in ["plaintext", "prepared"] else chat_template]
         save_model_assets(args.train.model_assets_dir, model_assets)
 
     if args.train.profile_this_rank:
@@ -262,13 +270,13 @@ def main():
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
 
-        data_loader_tqdm = trange(
-            args.train.train_steps,
-            desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
-            total=args.train.train_steps,
-            initial=start_step,
-            disable=args.train.local_rank != 0,
-        )
+        # data_loader_tqdm = trange(
+        #     args.train.train_steps,
+        #     desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
+        #     total=args.train.train_steps,
+        #     initial=start_step,
+        #     disable=args.train.local_rank != 0,
+        # )
         data_iterator = iter(train_dataloader)
         for _ in range(start_step, args.train.train_steps):
             global_step += 1
@@ -327,8 +335,9 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
-            data_loader_tqdm.update()
+            # data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            # data_loader_tqdm.update()
+            logger.info_rank0(f"{global_step} / {args.train.train_steps}, loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, elapsed time: {delta_time:.2f}s")
 
             if args.train.global_rank == 0:
                 if args.train.use_wandb:
@@ -361,7 +370,7 @@ def main():
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
-        data_loader_tqdm.close()
+        # data_loader_tqdm.close()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:

@@ -116,14 +116,17 @@ def process_sample_qwen2_5_vl(
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
     input_ids = tokenized_example["input_ids"]
 
-    tokenized_example["position_ids"] = position_id_func(
-        input_ids=input_ids.unsqueeze(0),
-        image_grid_thw=image_grid_thw,
-        video_grid_thw=video_grid_thw,
-        attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
-    )["position_ids"]  # (dim, 1, seq_length)
-    # Squeezed to (dim, seq_len) for later collator processing
-    tokenized_example["position_ids"] = tokenized_example["position_ids"].squeeze().clone()
+    if position_id_func is not None:
+        tokenized_example["position_ids"] = position_id_func(
+            input_ids=input_ids.unsqueeze(0),
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
+        )[
+            "position_ids"
+        ]  # (dim, 1, seq_length)
+        # Squeezed to (dim, seq_len) for later collator processing
+        tokenized_example["position_ids"] = tokenized_example["position_ids"].squeeze().clone()
 
     tokenized_example["image_mask"] = tokenized_example["input_ids"] == IMAGE_INPUT_INDEX
     tokenized_example["video_mask"] = tokenized_example["input_ids"] == VIDEO_INPUT_INDEX

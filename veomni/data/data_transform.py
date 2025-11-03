@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import json
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 import torch
@@ -34,6 +35,23 @@ def split_into_chunks(sequence: Sequence[int], chunk_size: int) -> List[List[int
         chunks.append(sequence[i : i + chunk_size])
 
     return chunks
+
+
+def process_prepared_example(
+    example: Dict[str, Any],
+    max_seq_len: int,
+    source_name: Optional[str] = None,
+) -> List[Dict[str, "torch.Tensor"]]:
+    input_ids = example["input_ids"]
+    attention_mask = example.get("attention_mask", [1] * len(input_ids))
+    labels = example.get("labels", input_ids)
+    return [
+        {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor(attention_mask),
+            "labels": torch.tensor(labels),
+        }
+    ]
 
 
 def process_pretrain_example(
