@@ -44,14 +44,11 @@ def process_prepared_example(
     input_ids = example["input_ids"]
     labels = example.get("labels")
 
-    input_ids = torch.tensor(input_ids)
-    attention_mask = torch.tensor([1] * len(input_ids))
-    labels = torch.tensor(labels) if labels else input_ids
     return [
         {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor([1] * len(input_ids)),
+            "labels": torch.tensor(labels if labels is not None else input_ids),
         }
     ]
 

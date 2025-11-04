@@ -64,6 +64,18 @@ def process_prepared_example(
     max_seq_len: int,
     source_name: Optional[str] = None,
 ) -> List[Dict[str, "torch.Tensor"]]:
+    input_ids = example["input_ids"]
+    labels = example.get("labels")
+    images = example.get("images")
+
+    return [
+        {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor([1] * len(input_ids)),
+            "labels": torch.tensor(labels if labels is not None else input_ids),
+        }
+    ]
+
     messages = example["messages"]
     if isinstance(messages, str):
         messages = json.loads(messages)

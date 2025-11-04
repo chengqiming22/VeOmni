@@ -2038,9 +2038,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
                 )
 
-            # if self.training and get_parallel_state().fsdp_enabled and pixel_values is None:
-            #     fake_embeds = self.visual.dummy_forward().mean() * 0.0
-            #     inputs_embeds = inputs_embeds + fake_embeds
+            if self.training and get_parallel_state().fsdp_enabled and pixel_values is None:
+                fake_embeds = self.visual.dummy_forward().mean() * 0.0
+                inputs_embeds = inputs_embeds + fake_embeds
 
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
         if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
