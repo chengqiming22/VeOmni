@@ -243,7 +243,13 @@ class DataArguments:
 
 @dataclass
 class TrainingArguments:
-    output_dir: str = field(
+    # output_dir: str = field(
+    #     metadata={"help": "Path to save model checkpoints."},
+    # )
+    checkpints_dir: str = field(
+        metadata={"help": "Path to save model checkpoints."},
+    )
+    output_model_dir: str = field(
         metadata={"help": "Path to save model checkpoints."},
     )
     lr: float = field(
@@ -627,14 +633,14 @@ class TrainingArguments:
         if self.load_checkpoint_path == "auto":
             from .checkpoint_utils import get_checkpoint_path
 
-            self.load_checkpoint_path = get_checkpoint_path(
-                output_dir=self.output_dir, is_local_rank0=self.local_rank == 0, ckpt_manager=self.ckpt_manager
-            )
+            self.load_checkpoint_path = get_checkpoint_path(output_dir=self.checkpints_dir, is_local_rank0=self.local_rank == 0, ckpt_manager=self.ckpt_manager)
 
         # save paths
-        self.save_checkpoint_path = os.path.join(self.output_dir, "checkpoints")
-        self.step2token_path = os.path.join(self.output_dir, "step2token.json")
-        self.model_assets_dir = os.path.join(self.output_dir, "model_assets")
+        self.save_checkpoint_path = os.path.join(self.checkpints_dir, "checkpoints")
+        self.step2token_path = os.path.join(self.checkpints_dir, "step2token.json")
+        self.model_assets_dir = os.path.join(self.checkpints_dir, "model_assets")
+        # self.final_model_path = os.path.join(self.output_model_dir, "final_model")
+        self.final_checkpoint_path = os.path.join(self.save_checkpoint_path, "final_checkpoint")
 
         # determine whether to profile this rank
         if self.enable_profiling:
@@ -919,7 +925,7 @@ def save_args(args: T, output_path: str) -> None:
         local_dir = helper.get_cache_dir()
         remote_dir = output_path
     else:
-        logger.warning_once("Recommend to use hdfs path or hdfs_fuse path as the output path.")
+        # logger.warning_once("Recommend to use hdfs path or hdfs_fuse path as the output path.")
         local_dir = output_path
         remote_dir = None
 

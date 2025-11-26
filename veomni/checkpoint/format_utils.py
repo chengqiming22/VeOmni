@@ -45,7 +45,7 @@ else:
 
 def ckpt_to_state_dict(
     save_checkpoint_path: Union[str, os.PathLike],
-    output_dir: Union[str, os.PathLike],
+    output_dir: Union[str, os.PathLike] = None,
     ckpt_manager: str = "omnistore",
 ) -> Dict[str, Any]:
     """

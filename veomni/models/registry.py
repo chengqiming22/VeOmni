@@ -61,7 +61,7 @@ class _ModelRegistry:
                 try:
                     module = importlib.import_module(name)
                 except Exception as e:
-                    logger.warning(f"Ignore import error when loading {name}. {e}")
+                    # logger.warning(f"Ignore import error when loading {name}. {e}")
                     continue
                 if hasattr(module, "ModelClass"):
                     entry = module.ModelClass

@@ -1,10 +1,13 @@
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
+from retrying import retry
 
 import torch
 import torch.distributed as dist
@@ -25,6 +28,7 @@ from veomni.data import (
     build_multimodal_chat_template,
 )
 from veomni.data.constants import IMAGE_INPUT_INDEX
+from veomni.data.data_collator import DataCollator
 from veomni.data.multimodal.preprocess import conv_preprocess
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
@@ -40,6 +44,7 @@ from veomni.utils.device import (
     synchronize,
 )
 from veomni.utils.dist_utils import all_reduce
+from qwen_vl_utils import fetch_image
 
 
 if TYPE_CHECKING:
@@ -51,50 +56,165 @@ if TYPE_CHECKING:
 logger = helper.create_logger(__name__)
 
 
-MAX_PIXELS = 768 * 28 * 28
+MAX_PIXELS = 256 * 28 * 28
 ROLE_MAPPING = {
     "human": "user",
     "gpt": "assistant",
 }
 
 
-def process_prepared_example(
-    example: Dict[str, Any],
+@retry(stop_max_attempt_number=10)
+def fetch_image_fn(image_url: str):
+    return fetch_image(
+        {
+            "image_url": image_url,
+            "max_pixels": MAX_PIXELS,
+        }
+    )
+
+
+@dataclass
+class BatchTransformSampleDataCollator(DataCollator):
+
+    def __init__(self, processor: "ProcessorMixin", position_id_func: "Callable", max_seq_len: int):
+        self.thread_pool = ThreadPoolExecutor(max_workers=100)
+        self.processor = processor
+        self.position_id_func = position_id_func
+        self.max_seq_len = max_seq_len
+        self.truncate_count = 0
+
+    def __call__(self, batch: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, "torch.Tensor"]]:
+        image_urls: list[str] = [image_url for sample in batch if sample.get("image_urls") for image_url in sample.get("image_urls")]
+        images = self.thread_pool.map(fetch_image_fn, image_urls) if len(image_urls) > 0 else []
+        image_map = {image_url: image for image_url, image in zip(image_urls, images)} if len(image_urls) > 0 else {}
+
+        tokenized_examples = []
+        for sample in batch:
+            input_ids = sample["input_ids"]
+            labels = sample.get("labels", input_ids)
+            image_urls = sample.get("image_urls", [])
+
+            image_inputs = {}
+            image_grid_thw = None
+
+            original_len = len(input_ids)
+
+            if image_urls:
+                images = [image_map[image_url] for image_url in image_urls]
+                image_inputs = self.processor.image_processor(images=images, return_tensors="pt")
+                image_grid_thw = image_inputs.get("image_grid_thw")
+
+                merge_length = self.processor.image_processor.merge_size**2
+                image_token_nums = image_grid_thw.prod(dim=-1) // merge_length
+
+                input_ids_tensor = torch.tensor(input_ids)
+                labels_tensor = torch.tensor(labels)
+                image_mask = input_ids_tensor == self.processor.image_token_id
+                image_indices = torch.where(image_mask)[0].tolist()
+
+                expanded_input_ids = []
+                expanded_labels = []
+                prev_end = 0
+                valid_image_indices = []
+
+                # 计算非图像token数：总token数 - 图像token数（每个图像占3个token：vision_start_token + image_token + vision_end_token）
+                keep_token_nums = len(input_ids_tensor) - len(image_indices) * 3
+
+                for image_idx, img_pos in enumerate(image_indices):
+                    # 图像结构：vision_start_token image_token vision_end_token
+                    # 默认 image_token 前一个就是 vision_start_token，后一个就是 vision_end_token
+                    vision_start_pos = img_pos - 1
+                    vision_end_pos = img_pos + 1
+                    
+                    # 添加 vision_start_token 之前的文本
+                    text_before = input_ids_tensor[prev_end:vision_start_pos]
+                    expanded_input_ids.append(text_before)
+                    expanded_labels.append(labels_tensor[prev_end:vision_start_pos])
+
+                    # 合并添加：vision_start_token + 展开的 image_token + vision_end_token
+                    num_tokens = image_token_nums[image_idx].item()
+                    image_tokens = torch.full((num_tokens,), self.processor.image_token_id, dtype=torch.long)
+                    image_segment = torch.cat([
+                        input_ids_tensor[vision_start_pos:vision_start_pos+1],  # vision_start_token
+                        image_tokens,  # 展开的 image_token
+                        input_ids_tensor[vision_end_pos:vision_end_pos+1],  # vision_end_token
+                    ])
+                    image_labels_segment = torch.cat([
+                        labels_tensor[vision_start_pos:vision_start_pos+1],  # vision_start_token label
+                        labels_tensor[img_pos : img_pos + 1].expand(num_tokens),  # 展开的 image_token labels
+                        labels_tensor[vision_end_pos:vision_end_pos+1],  # vision_end_token label
+                    ])
+                    image_segment_len = len(image_segment)
+                    if keep_token_nums + image_segment_len <= self.max_seq_len:
+                        expanded_input_ids.append(image_segment)
+                        expanded_labels.append(image_labels_segment)
+                        keep_token_nums += image_segment_len
+                        valid_image_indices.append(image_idx)
+                    else:
+                        pass
+                    original_len += image_segment_len - 3
+
+                    prev_end = vision_end_pos + 1
+
+                expanded_input_ids.append(input_ids_tensor[prev_end:])
+                expanded_labels.append(labels_tensor[prev_end:])
+
+                input_ids = torch.cat(expanded_input_ids).tolist()
+                labels = torch.cat(expanded_labels).tolist()
+
+                # 只保留有效图像的 grid_thw 和相关数据
+                if len(valid_image_indices) < len(image_token_nums):
+                    # 保存原始的 image_grid_thw，用于计算每个图像的序列长度
+                    original_image_grid_thw = image_grid_thw
+                    image_grid_thw = image_grid_thw[valid_image_indices]
+                    # 同时需要更新 image_inputs 中的其他字段
+                    if "pixel_values" in image_inputs:
+                        # pixel_values 的第一维是所有图像的序列长度之和，需要根据每个图像的序列长度来分割
+                        # 计算每个图像的序列长度（prod 得到的是特征数量，即序列长度）
+                        image_seq_lengths = original_image_grid_thw.prod(dim=-1)
+                        # 根据序列长度分割 pixel_values
+                        pixel_values_list = torch.split(image_inputs["pixel_values"], image_seq_lengths.tolist())
+                        # 只保留有效图像对应的 pixel_values
+                        valid_pixel_values = [pixel_values_list[idx] for idx in valid_image_indices]
+                        # 重新拼接
+                        image_inputs["pixel_values"] = torch.cat(valid_pixel_values, dim=0)
+                    if "image_grid_thw" in image_inputs:
+                        image_inputs["image_grid_thw"] = image_grid_thw
+                    if self.truncate_count == 0:
+                        logger.info_rank0(f"样本长度超过最大长度，截断到 {len(input_ids)} 个 token，原始长度为 {original_len}，保留 {len(valid_image_indices)} 个完整图像")
+                        self.truncate_count += 1
+                    self.truncate_count += 1
+
+            tokenized_example = {
+                "input_ids": torch.tensor(input_ids),
+                "attention_mask": torch.tensor([1] * len(input_ids)),
+                "labels": torch.tensor(labels),
+            }
+
+            tokenized_example["image_mask"] = tokenized_example["input_ids"] == self.processor.image_token_id
+            # tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
+            tokenized_example.update(image_inputs)
+
+            position_ids = self.position_id_func(
+                input_ids=tokenized_example["input_ids"].unsqueeze(0),
+                image_grid_thw=image_grid_thw,
+                attention_mask=tokenized_example["attention_mask"].unsqueeze(0),
+            )["position_ids"]
+            tokenized_example["position_ids"] = position_ids.squeeze().clone()
+
+            tokenized_examples.append(tokenized_example)
+
+        return tokenized_examples
+
+
+def process_prepared_sample(
+    sample: Dict[str, Any],
     processor: "ProcessorMixin",
     max_seq_len: int,
     source_name: Optional[str] = None,
+    position_id_func: "Callable" = None,
 ) -> List[Dict[str, "torch.Tensor"]]:
-    input_ids = example["input_ids"]
-    labels = example.get("labels")
-    images = example.get("images")
-
-    return [
-        {
-            "input_ids": torch.tensor(input_ids),
-            "attention_mask": torch.tensor([1] * len(input_ids)),
-            "labels": torch.tensor(labels if labels is not None else input_ids),
-        }
-    ]
-
-    messages = example["messages"]
-    if isinstance(messages, str):
-        messages = json.loads(messages)
-
-    text = processor.apply_chat_template(messages, tokenize=False)
-    image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(
-        text=text,
-        # images=image_inputs,
-        # videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs["input_ids"] = inputs["input_ids"].squeeze()
-    # inputs["image_mask"] = inputs["input_ids"] == processor.image_token_id
-    # inputs["input_ids"][inputs["image_mask"]] = 0
-    inputs["labels"] = inputs["input_ids"].clone()
-    inputs["attention_mask"] = inputs["attention_mask"].squeeze()
-    return [inputs]
+    return [sample]
 
 
 def process_sample(
@@ -175,8 +295,8 @@ class Arguments:
 
 def main():
     args = parse_args(Arguments)
-    logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
-    logger.info_rank0(json.dumps(asdict(args), indent=2))
+    # logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
+    # logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     if not dist.is_initialized():
         dist.init_process_group(backend=get_nccl_backend())
@@ -184,8 +304,8 @@ def main():
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
-    if args.train.global_rank == 0:
-        save_args(args, args.train.output_dir)
+    # if args.train.global_rank == 0:
+    #     save_args(args, args.train.output_dir)
 
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
@@ -205,24 +325,27 @@ def main():
     model = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
+        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
         init_device=args.train.init_device,
         force_use_huggingface=args.model.force_use_huggingface,
         attn_implementation=args.model.attn_implementation,
     )
     model_config = model.config
-    helper.print_device_mem_info("VRAM usage after building model")
+    # helper.print_device_mem_info("VRAM usage after building model")
 
     logger.info_rank0("Prepare data")
     processor = build_processor(args.model.tokenizer_path)
+    processor.image_processor.max_pixels = MAX_PIXELS
+    position_id_func = model.get_position_id_func()
+    processor.image_token_id = processor.tokenizer.convert_tokens_to_ids(processor.image_token)
     if args.data.data_type == "prepared":
         transform = partial(
-            process_prepared_example,
+            process_prepared_sample,
             processor=processor,
             max_seq_len=args.data.max_seq_len,
+            position_id_func=position_id_func,
         )
     elif args.data.data_type == "conversation":
-        processor.image_processor.max_pixels = MAX_PIXELS
-        position_id_func = model.get_position_id_func()
         chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
         transform = partial(
             process_sample,
@@ -234,7 +357,7 @@ def main():
     if args.train.rmpad:
         raise ValueError("Qwen2-VL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
 
-    data_collate_fn = []
+    data_collate_fn = [BatchTransformSampleDataCollator(processor, position_id_func, args.data.max_seq_len)]
     if args.train.rmpad_with_pos_ids:
         data_collate_fn.append(OmniDataCollatorWithPacking())
     else:
@@ -301,6 +424,7 @@ def main():
 
     model = build_parallelize_model(
         model,
+        weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
@@ -310,6 +434,7 @@ def main():
         basic_modules=model._no_split_modules,
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
+        broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
     )
     optimizer = build_optimizer(
         model,
@@ -330,16 +455,16 @@ def main():
         lr_start=args.train.lr_start,
     )
 
-    if args.train.global_rank == 0:
-        if args.train.use_wandb:
-            wandb.init(
-                project=args.train.wandb_project,
-                name=args.train.wandb_name,
-                config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
-            )
+    # if args.train.global_rank == 0:
+    #     if args.train.use_wandb:
+    #         wandb.init(
+    #             project=args.train.wandb_project,
+    #             name=args.train.wandb_name,
+    #             config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
+    #         )
 
-        model_assets = [model_config, processor]
-        save_model_assets(args.train.model_assets_dir, model_assets)
+    #     model_assets = [model_config, processor]
+    #     save_model_assets(args.train.model_assets_dir, model_assets)
 
     if args.train.profile_this_rank:
         profiler = helper.create_profiler(
@@ -454,7 +579,9 @@ def main():
 
             # data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
             # data_loader_tqdm.update()
-            logger.info_rank0(f"{global_step} / {args.train.train_steps}, loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, elapsed time: {delta_time:.2f}s")
+            logger.info_rank0(
+                f"epoch: {epoch + 1}, step: {global_step} / {args.train.train_steps}, loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, elapsed time: {delta_time:.2f}s"
+            )
 
             if args.train.global_rank == 0:
                 if args.train.use_wandb:
@@ -482,19 +609,19 @@ def main():
                     },
                 }
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-                if args.train.global_rank == 0:
-                    helper.save_step2token(
-                        args.train.step2token_path,
-                        consumed_tokens=train_metrics["consume_tokens(B)"],
-                        global_step=global_step,
-                        save_checkpoint_path=save_checkpoint_path,
-                    )
+                # if args.train.global_rank == 0:
+                #     helper.save_step2token(
+                #         args.train.step2token_path,
+                #         consumed_tokens=train_metrics["consume_tokens(B)"],
+                #         global_step=global_step,
+                #         save_checkpoint_path=save_checkpoint_path,
+                #     )
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
         # data_loader_tqdm.close()
         start_step = 0
-        helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+        # helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
             helper.empty_cache()
             save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
@@ -519,21 +646,46 @@ def main():
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
+    helper.empty_cache()
+    state = {
+        "model": model,
+        "optimizer": optimizer,
+        "extra_state": {
+            "global_step": global_step,
+            "lr_scheduler": lr_scheduler.state_dict(),
+            "train_dataloader": train_dataloader.state_dict(),
+            "environ_meter": environ_meter.state_dict(),
+        },
+    }
+    logger.info_rank0(f"saving final checkpoint to {args.train.final_checkpoint_path} ...")
+    Checkpointer.save(args.train.final_checkpoint_path, state)
+    # logger.info_rank0(f"final checkpoint saved at {args.train.final_checkpoint_path} successfully!")
+    dist.barrier()
+
     synchronize()
     # release memory
     del optimizer, lr_scheduler
     helper.empty_cache()
     # save model in huggingface's format
     if args.train.global_rank == 0:
-        if args.train.save_hf_weights and save_checkpoint_path is not None:
-            hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-            model_state_dict = ckpt_to_state_dict(
-                save_checkpoint_path=save_checkpoint_path,
-                output_dir=args.train.output_dir,
-                ckpt_manager=args.train.ckpt_manager,
-            )
-            save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-            logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+        # if args.train.save_hf_weights and save_checkpoint_path is not None:
+        #     hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+        #     model_state_dict = ckpt_to_state_dict(
+        #         save_checkpoint_path=save_checkpoint_path,
+        #         output_dir=args.train.output_dir,
+        #         ckpt_manager=args.train.ckpt_manager,
+        #     )
+        #     save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
+        #     logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+        model_state_dict = ckpt_to_state_dict(
+            save_checkpoint_path=args.train.final_checkpoint_path,
+            # output_dir=args.train.output_dir,
+            ckpt_manager=args.train.ckpt_manager,
+        )
+        model_assets = [model_config, processor]
+        logger.info_rank0(f"saving final model to {args.train.output_model_dir} ...")
+        save_model_weights(args.train.output_model_dir, model_state_dict, model_assets=model_assets)
+        # logger.info_rank0(f"final model saved at {args.train.output_model_dir} successfully!")
 
     dist.barrier()
     dist.destroy_process_group()

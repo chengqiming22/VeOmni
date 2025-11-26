@@ -373,7 +373,7 @@ def main():
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
             helper.empty_cache()
-            save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
+            save_checkpoint_path = f"{args.train.save_checkpoint_path}/final_checkpoint"
             state = {
                 "model": model,
                 "optimizer": optimizer,
@@ -385,7 +385,7 @@ def main():
                     "torch_rng_state": torch.get_rng_state(),
                 },
             }
-            Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+            Checkpointer.save(save_checkpoint_path, state)
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 

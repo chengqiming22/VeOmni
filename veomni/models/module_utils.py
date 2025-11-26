@@ -378,7 +378,7 @@ def rank0_load_and_broadcast_weights(
                 try:
                     key, tensor = next(iterator)  # type: ignore[arg-type]
                     key = _convert_weight_key(key, model)
-                    logger.info_rank0(f"loading {key=}")
+                    # logger.info_rank0(f"loading {key=}")
                     if torch.count_nonzero(tensor) == 0:
                         logger.warning_rank0(f"Detected tensor with all-zero values when reading safetensor: {key=}")
                     metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
@@ -399,7 +399,7 @@ def rank0_load_and_broadcast_weights(
             dtype = metadata.dtype
             if name is None or shape is None or dtype is None:
                 raise RuntimeError("Received incomplete broadcast metadata.")
-            logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
+            # logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
             if global_rank != 0:
                 tensor = torch.empty(shape, dtype=dtype, device=torch_device)
             else:
@@ -407,9 +407,9 @@ def rank0_load_and_broadcast_weights(
 
             start_time = time.perf_counter()
             dist.broadcast(tensor, src=0)
-            logger.info_rank0(
-                f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
-            )
+            # logger.info_rank0(
+            #     f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
+            # )
 
             if name in buffer_dict:
                 buffer_dict[name] = tensor.detach().clone()
@@ -592,9 +592,9 @@ def save_model_weights(
                 content = json.dumps(index, indent=2, sort_keys=True) + "\n"
                 f.write(content)
 
-            logger.info(f"Model weight splits saved in {output_dir}.")
-        else:
-            logger.info(f"Model weights saved at {os.path.join(output_dir, prev_file_name)}.")
+        #     logger.info(f"Model weight splits saved in {output_dir}.")
+        # else:
+        #     logger.info(f"Model weights saved at {os.path.join(output_dir, prev_file_name)}.")
 
         if model_assets is not None:
             for model_asset in model_assets:

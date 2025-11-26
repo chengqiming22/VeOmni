@@ -1709,8 +1709,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         self.rope_deltas = None  # cache rope_deltas here
 
         # Overwrite token ids
-        self.config.image_token_id = IMAGE_INPUT_INDEX
-        self.config.video_token_id = VIDEO_INPUT_INDEX
+        # self.config.image_token_id = IMAGE_INPUT_INDEX
+        # self.config.video_token_id = VIDEO_INPUT_INDEX
 
         # Initialize weights and apply final processing
         self.post_init()

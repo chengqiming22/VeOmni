@@ -369,7 +369,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 ),
             )
 
-        logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
+        # logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
     @classmethod
     def load(
